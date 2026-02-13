@@ -33,7 +33,7 @@ INTERNET_RAG_TOP_K = int(os.getenv("INTERNET_RAG_TOP_K", "6"))
 INTERNET_RAG_MAX_EXTRACT_URLS = int(os.getenv("INTERNET_RAG_MAX_EXTRACT_URLS", "5"))
 JINA_READER_TIMEOUT = float(os.getenv("JINA_READER_TIMEOUT", "12"))
 JINA_RERANKER_TIMEOUT = float(os.getenv("JINA_RERANKER_TIMEOUT", "8"))
-MAX_EVIDENCE_CHARS = int(os.getenv("MAX_EVIDENCE_CHARS", "1400"))
+MAX_EVIDENCE_CHARS = int(os.getenv("MAX_EVIDENCE_CHARS", "3500"))
 
 # SourceItem model - compatible with MultimodalLlamachat.py
 class SourceItem(BaseModel):
@@ -129,34 +129,59 @@ async def _tavily_search_with_rotation(query: str, max_results: int = 10) -> Dic
 async def _extract_content_via_jina_reader(url: str) -> Optional[str]:
     """
     Extract full page content using Jina Reader API.
-    
-    Returns markdown content or None on failure.
+    Handles both JSON responses (authenticated) and plain text (unauthenticated).
     """
     reader_url = f"https://r.jina.ai/{url}"
-    headers = {
+    headers: Dict[str, str] = {
         "X-Return-Format": "markdown",
-        "Accept": "application/json",
     }
     
     if JINA_API_KEY:
         headers["Authorization"] = f"Bearer {JINA_API_KEY}"
+        headers["Accept"] = "application/json"
     
     try:
         async with httpx.AsyncClient(timeout=JINA_READER_TIMEOUT) as client:
             resp = await client.get(reader_url, headers=headers)
         
         if resp.status_code == 200:
-            data = resp.json()
-            content = data.get("data", "") or data.get("content", "")
-            return content.strip() if content else None
+            content_type = resp.headers.get("content-type", "")
+            
+            # Try JSON parsing first (authenticated requests return JSON)
+            if "application/json" in content_type:
+                try:
+                    data = resp.json()
+                    if isinstance(data, dict):
+                        # Jina Reader JSON: {"code": 200, "data": {"content": "...", "title": "..."}}
+                        nested = data.get("data", {})
+                        if isinstance(nested, dict):
+                            content = nested.get("content", "")
+                        else:
+                            content = data.get("content", "") or str(data.get("data", ""))
+                    else:
+                        content = ""
+                    if content and isinstance(content, str) and len(content.strip()) > 100:
+                        print(f"✅ [Jina Reader] JSON extraction for {url[:60]}: {len(content)} chars", flush=True)
+                        return content.strip()
+                except Exception:
+                    pass
+            
+            # Fallback: plain text/markdown response (unauthenticated or non-JSON)
+            text = resp.text.strip()
+            if text and len(text) > 100:
+                print(f"✅ [Jina Reader] Text extraction for {url[:60]}: {len(text)} chars", flush=True)
+                return text
+            
+            print(f"⚠️ [Jina Reader] Response too short for {url[:60]}: {len(text)} chars", flush=True)
+            return None
         else:
-            print(f"⚠️ Jina Reader error for {url}: {resp.status_code}", flush=True)
+            print(f"⚠️ [Jina Reader] HTTP {resp.status_code} for {url[:60]}", flush=True)
             return None
     except asyncio.TimeoutError:
-        print(f"⏱️ Jina Reader timeout for {url}", flush=True)
+        print(f"⏱️ [Jina Reader] Timeout for {url[:60]}", flush=True)
         return None
     except Exception as e:
-        print(f"❌ Jina Reader exception for {url}: {e}", flush=True)
+        print(f"❌ [Jina Reader] Exception for {url[:60]}: {e}", flush=True)
         return None
 
 
@@ -327,9 +352,10 @@ async def internet_rag_search_and_extract(
     if not results:
         return [], []
     
-    # Step 2: Build initial sources list
+    # Step 2: Build sources and collect raw content from Tavily
     sources: List[SourceItem] = []
-    urls_to_extract: List[Tuple[int, str, str]] = []  # (index, url, title)
+    tavily_raw_contents: Dict[int, str] = {}  # idx -> raw_content
+    urls_needing_jina: List[Tuple[int, str, str]] = []  # URLs where Tavily didn't give enough
     
     for idx, result in enumerate(results[:max_sources], start=1):
         title = (result.get("title") or "Source").strip()
@@ -342,45 +368,61 @@ async def internet_rag_search_and_extract(
         
         sources.append(SourceItem(title=title, url=url, snippet=snippet or None))
         
-        # Collect URLs for deep extraction (prefer those without raw_content)
-        if len(urls_to_extract) < INTERNET_RAG_MAX_EXTRACT_URLS:
-            urls_to_extract.append((idx, url, title))
+        # Use Tavily raw_content if it's rich enough (>= 300 chars)
+        if raw_content and len(raw_content) >= 300:
+            tavily_raw_contents[idx] = raw_content
+            print(f"📄 [InternetRAG] Using Tavily raw_content for [{idx}] {title[:50]}: {len(raw_content)} chars", flush=True)
+        elif len(urls_needing_jina) < INTERNET_RAG_MAX_EXTRACT_URLS:
+            urls_needing_jina.append((idx, url, title))
     
-    # Step 3: Deep content extraction via Jina Reader (concurrent)
+    print(f"🔍 [InternetRAG] Tavily returned {len(results)} results | {len(tavily_raw_contents)} have rich raw_content | {len(urls_needing_jina)} need Jina extraction", flush=True)
+    
+    # Step 3: Build chunks from Tavily raw_content + Jina Reader extraction
     all_chunks: List[Dict[str, Any]] = []
     
-    if urls_to_extract:
-        extract_tasks = [
-            _extract_content_via_jina_reader(url) 
-            for _, url, _ in urls_to_extract
-        ]
+    # 3a: Chunk Tavily raw_content directly
+    for idx, raw_text in tavily_raw_contents.items():
+        src = sources[idx - 1] if idx <= len(sources) else None
+        title = src.title if src else "Source"
+        url = src.url if src else ""
+        text_chunks = _smart_chunk_text(raw_text, chunk_size=chunk_size)
+        for chunk_text in text_chunks:
+            all_chunks.append({
+                "source_index": idx,
+                "url": url,
+                "title": title,
+                "content": chunk_text,
+            })
+    
+    # 3b: Extract remaining URLs via Jina Reader (concurrent)
+    if urls_needing_jina:
+        extract_tasks = [_extract_content_via_jina_reader(url) for _, url, _ in urls_needing_jina]
         extracted_contents = await asyncio.gather(*extract_tasks, return_exceptions=True)
         
-        for (idx, url, title), content in zip(urls_to_extract, extracted_contents):
+        for (idx, url, title), content in zip(urls_needing_jina, extracted_contents):
             if isinstance(content, Exception) or not content:
-                # Fallback to Tavily snippet if extraction failed
+                # Fallback to Tavily snippet
                 for src in sources:
                     if src.url == url and src.snippet:
                         all_chunks.append({
                             "source_index": idx,
                             "url": url,
                             "title": title,
-                            "content": src.snippet[:chunk_size]
+                            "content": src.snippet[:chunk_size],
                         })
                         break
                 continue
             
-            # Split content into chunks
             text_chunks = _smart_chunk_text(content, chunk_size=chunk_size)
             for chunk_text in text_chunks:
                 all_chunks.append({
                     "source_index": idx,
                     "url": url,
                     "title": title,
-                    "content": chunk_text
+                    "content": chunk_text,
                 })
     
-    # If no chunks from extraction, use Tavily snippets as fallback
+    # Fallback if nothing worked
     if not all_chunks:
         for idx, src in enumerate(sources, start=1):
             if src.snippet:
@@ -388,14 +430,18 @@ async def internet_rag_search_and_extract(
                     "source_index": idx,
                     "url": src.url,
                     "title": src.title,
-                    "content": src.snippet[:chunk_size]
+                    "content": src.snippet[:chunk_size],
                 })
+    
+    print(f"📦 [InternetRAG] Created {len(all_chunks)} total chunks", flush=True)
     
     # Step 4: Rerank chunks by semantic relevance
     if all_chunks and JINA_API_KEY:
         reranked_chunks = await _rerank_chunks_via_jina(query, all_chunks, top_k)
     else:
         reranked_chunks = all_chunks[:top_k]
+    
+    print(f"🏆 [InternetRAG] Reranked to {len(reranked_chunks)} chunks (largest: {max(len(c.get('content','')) for c in reranked_chunks) if reranked_chunks else 0} chars)", flush=True)
     
     return sources, reranked_chunks
 
@@ -428,7 +474,7 @@ def build_web_evidence_block(
     # Add evidence excerpts
     excerpt_lines: List[str] = []
     if evidence_chunks:
-        for j, chunk in enumerate(evidence_chunks[:6], start=1):
+        for j, chunk in enumerate(evidence_chunks[:8], start=1):
             source_idx = chunk.get("source_index") or ""
             content = (chunk.get("content") or "").strip()
             if not source_idx or not content:
@@ -436,12 +482,12 @@ def build_web_evidence_block(
             
             # Use letter suffix for multiple excerpts from same source
             suffix = chr(ord("a") + (j - 1) % 26)
-            excerpt_lines.append(f"[{source_idx}{suffix}] {content[:500]}")
+            excerpt_lines.append(f"[{source_idx}{suffix}] {content[:800]}")
     else:
         # Fallback: use source snippets
         for i, src in enumerate(sources[:6], start=1):
             if src.snippet:
-                excerpt_lines.append(f"[{i}a] {src.snippet[:350]}")
+                excerpt_lines.append(f"[{i}a] {src.snippet[:600]}")
             if len(excerpt_lines) >= 4:
                 break
     
@@ -454,5 +500,7 @@ def build_web_evidence_block(
     # Enforce character limit
     if len(block) > max_chars:
         block = block[:max_chars] + "..."
+    
+    print(f"📋 [InternetRAG] Evidence block: {len(block)} chars, {len(excerpt_lines)} excerpts", flush=True)
     
     return block
