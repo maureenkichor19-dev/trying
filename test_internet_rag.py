@@ -31,7 +31,6 @@ def test_imports():
 def test_tavily_key_rotation():
     """Test the key rotation logic."""
     from app.services.internet_rag_service import TavilyKeyState
-    import time
     
     keys = ["key1", "key2", "key3"]
     state = TavilyKeyState(keys)
@@ -77,7 +76,9 @@ def test_smart_chunking():
     long_text = "Paragraph 1.\n\n" + ("Paragraph 2 with lots of text. " * 50)
     chunks = _smart_chunk_text(long_text, chunk_size=500, max_chunk_size=800)
     assert len(chunks) > 1, "Long text should be split into multiple chunks"
-    assert all(len(chunk) <= 850 for chunk in chunks), "Chunks should respect max size (with margin)"
+    # Allow small margin for paragraph boundaries and separators
+    max_acceptable = 850
+    assert all(len(chunk) <= max_acceptable for chunk in chunks), f"Chunks should respect max size (with small margin for boundaries)"
     
     # Test that paragraphs are preserved when possible
     multi_para = "First paragraph.\n\nSecond paragraph.\n\nThird paragraph."

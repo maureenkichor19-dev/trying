@@ -16,7 +16,6 @@ import asyncio
 import httpx
 from typing import List, Dict, Tuple, Optional, Any
 from pydantic import BaseModel
-from datetime import datetime, timedelta
 
 # Environment variables
 TAVILY_API_KEYS = [
@@ -196,15 +195,19 @@ def _smart_chunk_text(text: str, chunk_size: int = 800, max_chunk_size: int = 12
                 sent = sent.strip()
                 if not sent:
                     continue
-                sent_size = len(sent) + 2  # Account for ". "
+                
+                # Only add period if sentence doesn't already end with one
+                if not sent.endswith("."):
+                    sent = sent + "."
+                sent_size = len(sent) + 1  # Account for space separator
                 
                 if current_size + sent_size > max_chunk_size:
                     if current_chunk:
                         chunks.append(" ".join(current_chunk))
-                    current_chunk = [sent + "."]
+                    current_chunk = [sent]
                     current_size = sent_size
                 else:
-                    current_chunk.append(sent + ".")
+                    current_chunk.append(sent)
                     current_size += sent_size
         else:
             # Check if adding this paragraph would exceed max size
