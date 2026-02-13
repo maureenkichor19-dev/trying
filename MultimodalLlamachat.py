@@ -16,6 +16,7 @@ from app.services.rag_service import retrieve_rag_context, is_rag_domain, is_rag
 from app.services.domain_classifier import classify_domain
 from app.services.moderation_service import moderate_message
 from app.services.domain_classifier import classify_domain, validate_domain
+from app.services.internet_rag_service import internet_rag_search_and_extract, build_web_evidence_block
 
 load_dotenv()
 
@@ -1181,80 +1182,9 @@ def build_rag_block(chunks: List[Dict[str, str]]) -> str:
 # -----------------------
 # Internet RAG extraction (Tavily)
 # -----------------------
-async def internet_rag_search_and_extract(
-    query: str, max_sources: int = 6
-) -> Tuple[List[SourceItem], List[Dict[str, str]]]:
-    if not TAVILY_API_KEY or not query.strip():
-        return [], []
-    url = "https://api.tavily.com/search"
-    payload = {
-        "api_key": TAVILY_API_KEY,
-        "query": query,
-        "max_results": max(1, min(max_sources, 10)),
-        "include_answer": False,
-        "include_raw_content": False,
-        "search_depth": "advanced",
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.post(url, json=payload)
-        if resp.status_code >= 400:
-            print("TAVILY ERROR:", resp.status_code, resp.text[:300], flush=True)
-            return [], []
-        data = resp.json() or {}
-    except Exception as e:
-        print(f"TAVILY EXCEPTION: {e}", flush=True)
-        return [], []
-
-    results = data.get("results") or []
-    sources: List[SourceItem] = []
-    evidence_chunks: List[Dict[str, str]] = []
-
-    for idx, it in enumerate(results[:max_sources], start=1):
-        title = (it.get("title") or "Source").strip()
-        link = (it.get("url") or "").strip()
-        snippet = (it.get("content") or "").strip()
-        if not link:
-            continue
-
-        sources.append(SourceItem(title=title, url=link, snippet=snippet or None))
-        if snippet:
-            evidence_chunks.append({"source_index": idx, "content": snippet[:800]})
-
-    return sources, evidence_chunks
-
-def build_web_evidence_block(sources: List[SourceItem], evidence_chunks: List[Dict[str, str]]) -> str:
-    if not sources:
-        return ""
-    lines = ["[SOURCES]"]
-    for i, s in enumerate(sources[:6], start=1):
-        lines.append(f"[{i}] Title: {s.title}\n    URL: {s.url}")
-    # Prefer explicit evidence chunks when provided; otherwise include Google snippets
-    excerpt_lines: List[str] = []
-    if evidence_chunks:
-        for j, ch in enumerate(evidence_chunks[:4], start=1):
-            si = ch.get("source_index") or ""
-            content = (ch.get("content") or "").strip()
-            if not si or not content:
-                continue
-            suffix = chr(ord("a") + (j - 1) % 26)
-            excerpt_lines.append(f"[{si}{suffix}] {content[:350]}")
-    else:
-        # Fallback: use available snippets from Google CSE results
-        for i, s in enumerate(sources[:6], start=1):
-            snip = (s.snippet or "").strip()
-            if snip:
-                excerpt_lines.append(f"[{i}a] {snip[:350]}")
-            if len(excerpt_lines) >= 4:
-                break
-    if excerpt_lines:
-        lines.append("\n[EVIDENCE EXCERPTS]")
-        lines.extend(excerpt_lines)
-    block = "\n".join(lines).strip()
-    if len(block) > MAX_EVIDENCE_CHARS:
-        block = block[:MAX_EVIDENCE_CHARS] + "..."
-    return block
+# NOTE: internet_rag_search_and_extract() and build_web_evidence_block()
+# have been moved to app/services/internet_rag_service.py for better modularity.
+# They are now imported at the top of this file.
 
 # -----------------------
 # Google web sources (CSE)
