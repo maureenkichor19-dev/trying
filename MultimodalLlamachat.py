@@ -201,6 +201,9 @@ MAX_EVIDENCE_CHARS = 3500
 MAX_HISTORY_CHARS = 900
 MAX_MESSAGE_CHARS = 800
 
+# Pre-fetch timeout for time-sensitive queries (allows deep extraction)
+PRE_FETCH_TIMEOUT_SEC = 15.0
+
 # -----------------------
 # PROMPTS
 # -----------------------
@@ -780,6 +783,12 @@ _WEB_WORDS_RE = re.compile(
 
 # ✅ NEW: "year request" signals a time-sensitive lookup (e.g., "released in 2026")
 _YEAR_WEB_INTENT_RE = re.compile(r"\b(released|release|airing|air|premiere|premiered|new|best)\b.*\b(20\d{2})\b", re.I)
+
+# Time signal words indicating need for real-time/recent information
+_TIME_SIGNAL_RE = re.compile(
+    r"\b(latest|newest|recent|current|now|today|this year|trending|airing|released|premiered|upcoming|new)\b",
+    re.I
+)
 
 _UNCERTAIN_RE = re.compile(
     r"\b(i (don't|do not) know|not sure|can't verify|cannot verify|unsure|might be|may be|could be|depends|"
@@ -2610,10 +2619,7 @@ async def generate_cloud_structured(
     if _has_web_providers() and not is_smalltalk_or_identity(message):
         msg_text = (message or "").strip()
         # Pre-fetch for: explicit web intent, factual questions, time-sensitive queries, "who is" questions
-        has_time_signal = bool(_YEAR_WEB_INTENT_RE.search(msg_text)) or bool(re.search(
-            r"\b(latest|newest|recent|current|now|today|this year|trending|airing|released|premiered|upcoming|new)\b",
-            msg_text, re.I
-        ))
+        has_time_signal = bool(_YEAR_WEB_INTENT_RE.search(msg_text)) or bool(_TIME_SIGNAL_RE.search(msg_text))
         has_factual_intent = bool(_FACTUAL_WEB_INTENT_RE.search(msg_text))
         is_who = is_who_is_question(msg_text)
         explicit_web = user_flags.get("want_web", False)
@@ -2626,7 +2632,7 @@ async def generate_cloud_structured(
             try:
                 pre_fetched_sources, pre_fetched_chunks = await asyncio.wait_for(
                     internet_rag_search_and_extract(prefetch_query, max_sources=6),
-                    timeout=15.0  # Allow more time since this is critical
+                    timeout=PRE_FETCH_TIMEOUT_SEC
                 )
                 if pre_fetched_sources and pre_fetched_chunks:
                     pre_fetched_evidence_block = build_web_evidence_block(pre_fetched_sources, pre_fetched_chunks)

@@ -174,11 +174,11 @@ def test_fix_1_prefetch_logic():
         'pre_fetched_sources init': 'pre_fetched_sources: List[SourceItem] = []' in content,
         'pre_fetched_chunks init': 'pre_fetched_chunks: List[Dict[str, str]] = []' in content,
         'should_prefetch flag': 'should_prefetch = False' in content,
-        'time signal detection': 'has_time_signal = bool(_YEAR_WEB_INTENT_RE.search(msg_text))' in content,
+        'time signal detection': 'has_time_signal = bool(_YEAR_WEB_INTENT_RE.search(msg_text)) or bool(_TIME_SIGNAL_RE.search(msg_text))' in content,
         'factual intent detection': 'has_factual_intent = bool(_FACTUAL_WEB_INTENT_RE.search(msg_text))' in content,
         'pre-fetch condition': 'should_prefetch = has_time_signal or has_factual_intent' in content,
         'internet_rag_search_and_extract call': 'internet_rag_search_and_extract(prefetch_query, max_sources=6)' in content,
-        '15s timeout': 'timeout=15.0  # Allow more time since this is critical' in content,
+        'PRE_FETCH_TIMEOUT_SEC constant': 'PRE_FETCH_TIMEOUT_SEC = 15.0' in content or 'timeout=PRE_FETCH_TIMEOUT_SEC' in content,
         'evidence block build': 'pre_fetched_evidence_block = build_web_evidence_block(pre_fetched_sources, pre_fetched_chunks)' in content
     }
     
