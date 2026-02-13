@@ -201,6 +201,9 @@ MAX_EVIDENCE_CHARS = 3500
 MAX_HISTORY_CHARS = 900
 MAX_MESSAGE_CHARS = 800
 
+# Pre-fetch timeout for time-sensitive queries (allows deep extraction)
+PRE_FETCH_TIMEOUT_SEC = 15.0
+
 # -----------------------
 # PROMPTS
 # -----------------------
@@ -405,6 +408,11 @@ def build_runpod_user_prompt(
     if safe_rag:
         user_context_parts.append(safe_rag)
     if safe_evidence:
+        user_context_parts.append(
+            "USE THE FOLLOWING WEB EVIDENCE to provide accurate, up-to-date information. "
+            "Include specific names, dates, and details from the evidence. "
+            "Do NOT mention [SOURCES] or [EVIDENCE EXCERPTS] labels in your answer."
+        )
         user_context_parts.append(safe_evidence)
 
     # Compact recent history, avoid duplicates.
@@ -566,27 +574,35 @@ def build_second_pass_prompt_chat(
             f"<|start_header_id|>{role}<|end_header_id|>\n" + _truncate(h.content, 240) + "<|eot_id|>"
         )
 
-    # Current user message
-    p += (
-        "<|start_header_id|>user<|end_header_id|>\n" + safe_msg + "<|eot_id|>"
-        "<|start_header_id|>assistant<|end_header_id|>\n"
-    )
-
-    # Context blocks
+    # Build user turn with all context INSIDE the user message
+    user_parts: List[str] = []
+    
     if safe_article:
-        p += "[ARTICLE_CONTEXT]\n" + safe_article + "\n\n"
+        user_parts.append(f"[ARTICLE_CONTEXT]\n{safe_article}")
     if safe_orig:
-        p += "[ORIGINAL_ANSWER]\n" + safe_orig + "\n\n"
+        user_parts.append(f"[ORIGINAL_ANSWER]\n{safe_orig}")
     if safe_evidence:
-        p += safe_evidence + "\n\n"
-
-    # Revision rules (inline, non-JSON)
+        user_parts.append(safe_evidence)
+    
+    # Revision instruction (inside user turn so model doesn't echo it)
+    user_parts.append(
+        "TASK: Rewrite and improve the [ORIGINAL_ANSWER] using the latest facts from [SOURCES] and [EVIDENCE EXCERPTS] above.\n"
+        "- Integrate specific details (names, dates, platforms) from the evidence.\n"
+        "- When sources conflict with original answer, trust the [SOURCES].\n"
+        "- Produce a complete, informative markdown answer. Match or exceed the original detail.\n"
+        "- Preserve friendly tone. Add [[cite:N]] after sentences supported by evidence.\n"
+        "- Do NOT include [SOURCES], [EVIDENCE EXCERPTS], [REVISION_RULES], or any labels in your output.\n"
+        "- Output plain markdown only, no JSON."
+    )
+    
+    user_parts.append(safe_msg)
+    
+    user_payload = "\n\n".join([p for p in user_parts if p]).strip()
+    
     p += (
-        "[REVISION_RULES]\n"
-        "- Integrate corrections and the latest facts from [SOURCES]; prefer them on conflicts.\n"
-        "- Produce a complete, informative answer (do NOT shorten/paraphrase excessively); match or exceed original detail.\n"
-        "- Preserve friendly tone and formatting; where appropriate, add [[cite:N]] after sentences supported by [SOURCES].\n"
-        "- Output plain markdown only; no JSON.\n"
+        "<|start_header_id|>user<|end_header_id|>\n"
+        f"{user_payload}<|eot_id|>"
+        "<|start_header_id|>assistant<|end_header_id|>\n"
     )
 
     return p[:MAX_PROMPT_CHARS] if len(p) > MAX_PROMPT_CHARS else p
@@ -650,7 +666,7 @@ async def fast_google_web_search(query: str, num: int = 6, timeout_sec: float = 
     _cache_google[key] = (now, res)
     return res
 
-async def fast_tavily(query: str, max_sources: int = 6, timeout_sec: float = 4.5) -> Tuple[List['SourceItem'], List[Dict[str, str]]]:
+async def fast_tavily(query: str, max_sources: int = 6, timeout_sec: float = 20.0) -> Tuple[List['SourceItem'], List[Dict[str, str]]]:
     key = (query or "", int(max_sources))
     now = time.perf_counter()
     cached = _cache_tavily.get(key)
@@ -767,6 +783,12 @@ _WEB_WORDS_RE = re.compile(
 
 # ✅ NEW: "year request" signals a time-sensitive lookup (e.g., "released in 2026")
 _YEAR_WEB_INTENT_RE = re.compile(r"\b(released|release|airing|air|premiere|premiered|new|best)\b.*\b(20\d{2})\b", re.I)
+
+# Time signal words indicating need for real-time/recent information
+_TIME_SIGNAL_RE = re.compile(
+    r"\b(latest|newest|recent|current|now|today|this year|trending|airing|released|premiered|upcoming|new)\b",
+    re.I
+)
 
 _UNCERTAIN_RE = re.compile(
     r"\b(i (don't|do not) know|not sure|can't verify|cannot verify|unsure|might be|may be|could be|depends|"
@@ -1581,6 +1603,7 @@ def cleanup_model_text(text: str) -> str:
     out = re.sub(r"<\|.*?\|>", "", out)
     # Remove [USER] and [ASSISTANT] tags (model echoes)
     out = re.sub(r"^\s*\[(USER|ASSISTANT)\]\s*", "", out, flags=re.MULTILINE)
+    
     # Remove all leaked internal labels and everything after them
     for label in [
         "[SOURCES]",
@@ -1595,9 +1618,22 @@ def cleanup_model_text(text: str) -> str:
         if m:
             out = out[: m.start()]
     
-    # Remove leaked instruction-style lines that sometimes appear at the start
+    # Also catch labels at the very start of the text (no preceding newline)
+    for label in [
+        "[SOURCES]",
+        "[EVIDENCE EXCERPTS]",
+        "[EVIDENCE_EXCERPTS]",
+        "[REVISION_RULES]",
+        "[ARTICLE_CONTEXT]",
+        "[RAG_CONTEXT]",
+        "[ORIGINAL_ANSWER]",
+    ]:
+        if out.strip().startswith(label):
+            out = out.strip()[len(label):].strip()
+    
+    # Remove leaked instruction-style lines that sometimes appear
     out = re.sub(
-        r"^\s*(Remove or replace \[|Use a light touch|Focus on big-picture|Optionally include a short closing|Do not mention training).*$",
+        r"^\s*(Remove or replace \[|Use a light touch|Focus on big-picture|Optionally include a short closing|Do not mention training|Where possible, use simple).*$",
         "",
         out,
         flags=re.MULTILINE | re.IGNORECASE,
@@ -2570,12 +2606,49 @@ async def generate_cloud_structured(
             pass
 
 
+    # ✅ PRE-FETCH: For time-sensitive/fact-seeking queries, get web evidence BEFORE the first draft
+    # so the LLM sees real-time data on its first pass instead of generating from stale knowledge.
+    pre_fetched_evidence_block = ""
+    pre_fetched_sources: List[SourceItem] = []
+    pre_fetched_chunks: List[Dict[str, str]] = []
+    
+    # Determine if we should pre-fetch
+    should_prefetch = False
+    prefetch_query = ""
+    
+    if _has_web_providers() and not is_smalltalk_or_identity(message):
+        msg_text = (message or "").strip()
+        # Pre-fetch for: explicit web intent, factual questions, time-sensitive queries, "who is" questions
+        has_time_signal = bool(_YEAR_WEB_INTENT_RE.search(msg_text)) or bool(_TIME_SIGNAL_RE.search(msg_text))
+        has_factual_intent = bool(_FACTUAL_WEB_INTENT_RE.search(msg_text))
+        is_who = is_who_is_question(msg_text)
+        explicit_web = user_flags.get("want_web", False)
+        
+        should_prefetch = has_time_signal or has_factual_intent or is_who or explicit_web or FORCE_WEB_SOURCES
+        
+        if should_prefetch:
+            prefetch_query = enforce_web_query_constraints(msg_text, make_fallback_query(msg_text, max_len=120))
+            print(f"🌐 [PreFetch] Pre-fetching web evidence for: {prefetch_query[:80]}", flush=True)
+            try:
+                pre_fetched_sources, pre_fetched_chunks = await asyncio.wait_for(
+                    internet_rag_search_and_extract(prefetch_query, max_sources=6),
+                    timeout=PRE_FETCH_TIMEOUT_SEC
+                )
+                if pre_fetched_sources and pre_fetched_chunks:
+                    pre_fetched_evidence_block = build_web_evidence_block(pre_fetched_sources, pre_fetched_chunks)
+                    print(f"✅ [PreFetch] Got {len(pre_fetched_sources)} sources, {len(pre_fetched_chunks)} chunks, evidence block: {len(pre_fetched_evidence_block)} chars", flush=True)
+                else:
+                    print(f"⚠️ [PreFetch] No results for: {prefetch_query[:80]}", flush=True)
+            except Exception as e:
+                print(f"⚠️ [PreFetch] Failed (will retry in second pass): {e}", flush=True)
+
     # ✅ Draft answer first (no tools yet)
     if RUNPOD_RUN_ENDPOINT:
         prompt1 = build_runpod_user_prompt(
             message,
             trimmed_history,
             rag_block=rag_block,
+            web_evidence_block=pre_fetched_evidence_block,  # ✅ NOW INCLUDED!
             article_block=article_block,
             chat_mode=chat_flag,
             learning_preference=learning_pref,
@@ -2593,6 +2666,7 @@ async def generate_cloud_structured(
                 message,
                 trimmed_history,
                 rag_block=rag_block,
+                web_evidence_block=pre_fetched_evidence_block,  # ✅ NOW INCLUDED!
                 article_block=article_block,
                 chat_mode=chat_flag,
                 learning_preference=learning_pref,
@@ -2844,29 +2918,35 @@ async def generate_cloud_structured(
             base_for_web = f"{base_for_web} additional details new information not already mentioned"[:180]
         web_q = enforce_web_query_constraints(message, base_for_web)
 
-        # Fast, budget-aware web fetch.
-        try:
-            g_task = asyncio.create_task(fast_google_web_search(web_q, num=google_num, timeout_sec=google_timeout))
-            if tavily_num > 0 and TAVILY_API_KEY:
-                t_task = asyncio.create_task(fast_tavily(web_q, max_sources=tavily_num, timeout_sec=tavily_timeout))
-                g_res, (tav_sources, tav_chunks) = await asyncio.gather(g_task, t_task)
-            else:
-                g_res = await g_task
-                tav_sources, tav_chunks = ([], [])
-            sources = g_res or []
-            evidence_chunks = tav_chunks
-            if tav_sources:
-                seen = {s.url.lower(): s for s in sources if s.url}
-                for s in tav_sources:
-                    key = (s.url or "").lower()
-                    if key and key not in seen:
-                        sources.append(s)
-                        seen[key] = s
-        except Exception as e:
+        # Reuse pre-fetched results if we have them and the query is similar
+        if pre_fetched_sources and pre_fetched_chunks:
+            sources = pre_fetched_sources
+            evidence_chunks = pre_fetched_chunks
+            print(f"♻️ [WebSources] Reusing pre-fetched evidence ({len(sources)} sources)", flush=True)
+        else:
+            # Fast, budget-aware web fetch.
             try:
-                print("WEB FETCH FAILED (fail-soft)", {"error": str(e), "web_q": web_q[:120]}, flush=True)
-            except Exception:
-                pass
+                g_task = asyncio.create_task(fast_google_web_search(web_q, num=google_num, timeout_sec=google_timeout))
+                if tavily_num > 0 and TAVILY_API_KEY:
+                    t_task = asyncio.create_task(fast_tavily(web_q, max_sources=tavily_num, timeout_sec=tavily_timeout))
+                    g_res, (tav_sources, tav_chunks) = await asyncio.gather(g_task, t_task)
+                else:
+                    g_res = await g_task
+                    tav_sources, tav_chunks = ([], [])
+                sources = g_res or []
+                evidence_chunks = tav_chunks
+                if tav_sources:
+                    seen = {s.url.lower(): s for s in sources if s.url}
+                    for s in tav_sources:
+                        key = (s.url or "").lower()
+                        if key and key not in seen:
+                            sources.append(s)
+                            seen[key] = s
+            except Exception as e:
+                try:
+                    print("WEB FETCH FAILED (fail-soft)", {"error": str(e), "web_q": web_q[:120]}, flush=True)
+                except Exception:
+                    pass
 
         if not sources:
             need_web = False
