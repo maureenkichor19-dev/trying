@@ -194,10 +194,10 @@ if ENABLE_LOCAL_LLAMA:
 # -----------------------
 # PROMPT SIZE GUARDS
 # -----------------------
-MAX_PROMPT_CHARS = 6000
+MAX_PROMPT_CHARS = 10000
 MAX_ARTICLE_CHARS = 1200
 MAX_RAG_CHARS = 600
-MAX_EVIDENCE_CHARS = 1400
+MAX_EVIDENCE_CHARS = 3500
 MAX_HISTORY_CHARS = 900
 MAX_MESSAGE_CHARS = 800
 
@@ -1581,10 +1581,27 @@ def cleanup_model_text(text: str) -> str:
     out = re.sub(r"<\|.*?\|>", "", out)
     # Remove [USER] and [ASSISTANT] tags (model echoes)
     out = re.sub(r"^\s*\[(USER|ASSISTANT)\]\s*", "", out, flags=re.MULTILINE)
-    # Remove trailing [SOURCES] section entirely (frontend shows clickable sources separately)
-    m = re.search(r"\n\[SOURCES\]", out, flags=re.IGNORECASE)
-    if m:
-        out = out[: m.start()]  # drop everything from [SOURCES] downward
+    # Remove all leaked internal labels and everything after them
+    for label in [
+        "[SOURCES]",
+        "[EVIDENCE EXCERPTS]",
+        "[EVIDENCE_EXCERPTS]",
+        "[REVISION_RULES]",
+        "[ARTICLE_CONTEXT]",
+        "[RAG_CONTEXT]",
+        "[ORIGINAL_ANSWER]",
+    ]:
+        m = re.search(r"\n" + re.escape(label), out, flags=re.IGNORECASE)
+        if m:
+            out = out[: m.start()]
+    
+    # Remove leaked instruction-style lines that sometimes appear at the start
+    out = re.sub(
+        r"^\s*(Remove or replace \[|Use a light touch|Focus on big-picture|Optionally include a short closing|Do not mention training).*$",
+        "",
+        out,
+        flags=re.MULTILINE | re.IGNORECASE,
+    )
     # Normalize excessive blank lines
     out = re.sub(r"\n{3,}", "\n\n", out).strip()
     return out
