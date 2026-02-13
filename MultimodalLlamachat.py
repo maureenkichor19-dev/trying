@@ -1,6 +1,6 @@
 
 from __future__ import annotations
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Query
 from pydantic import BaseModel, Field
 import re
 from typing import List, Literal, Optional, Dict, Any, Tuple
@@ -194,10 +194,10 @@ if ENABLE_LOCAL_LLAMA:
 # -----------------------
 # PROMPT SIZE GUARDS
 # -----------------------
-MAX_PROMPT_CHARS = 6000
+MAX_PROMPT_CHARS = 10000
 MAX_ARTICLE_CHARS = 1200
 MAX_RAG_CHARS = 600
-MAX_EVIDENCE_CHARS = 1400
+MAX_EVIDENCE_CHARS = 3500
 MAX_HISTORY_CHARS = 900
 MAX_MESSAGE_CHARS = 800
 
@@ -1581,10 +1581,27 @@ def cleanup_model_text(text: str) -> str:
     out = re.sub(r"<\|.*?\|>", "", out)
     # Remove [USER] and [ASSISTANT] tags (model echoes)
     out = re.sub(r"^\s*\[(USER|ASSISTANT)\]\s*", "", out, flags=re.MULTILINE)
-    # Remove trailing [SOURCES] section entirely (frontend shows clickable sources separately)
-    m = re.search(r"\n\[SOURCES\]", out, flags=re.IGNORECASE)
-    if m:
-        out = out[: m.start()]  # drop everything from [SOURCES] downward
+    # Remove all leaked internal labels and everything after them
+    for label in [
+        "[SOURCES]",
+        "[EVIDENCE EXCERPTS]",
+        "[EVIDENCE_EXCERPTS]",
+        "[REVISION_RULES]",
+        "[ARTICLE_CONTEXT]",
+        "[RAG_CONTEXT]",
+        "[ORIGINAL_ANSWER]",
+    ]:
+        m = re.search(r"\n" + re.escape(label), out, flags=re.IGNORECASE)
+        if m:
+            out = out[: m.start()]
+    
+    # Remove leaked instruction-style lines that sometimes appear at the start
+    out = re.sub(
+        r"^\s*(Remove or replace \[|Use a light touch|Focus on big-picture|Optionally include a short closing|Do not mention training).*$",
+        "",
+        out,
+        flags=re.MULTILINE | re.IGNORECASE,
+    )
     # Normalize excessive blank lines
     out = re.sub(r"\n{3,}", "\n\n", out).strip()
     return out
@@ -3375,6 +3392,238 @@ async def update_query_domain(query_id: str, detected_domain: str) -> None:
                 print("⚠️ Failed to update query domain:", resp.status_code, resp.text[:200], flush=True)
     except Exception as e:
         print(f"⚠️ Failed to update query domain: {e}", flush=True)
+
+# -----------------------
+# DIAGNOSTIC ENDPOINT
+# -----------------------
+@router.get("/internet_rag_diagnostic")
+async def internet_rag_diagnostic(query: str = Query(default="latest kdrama 2026")):
+    """
+    Diagnostic endpoint to inspect the full Internet RAG pipeline.
+    Run: curl "http://localhost:8000/llamachats-multi/internet_rag_diagnostic?query=your+query+here"
+    """
+    import traceback
+    from app.services.internet_rag_service import (
+        internet_rag_search_and_extract,
+        build_web_evidence_block,
+        _tavily_search_with_rotation,
+        _extract_content_via_jina_reader,
+        _rerank_chunks_via_jina,
+        _smart_chunk_text,
+        TAVILY_API_KEYS,
+        JINA_API_KEY,
+        INTERNET_RAG_CHUNK_SIZE,
+        INTERNET_RAG_TOP_K,
+        INTERNET_RAG_MAX_EXTRACT_URLS,
+        MAX_EVIDENCE_CHARS as INTERNET_RAG_MAX_EVIDENCE_CHARS,
+    )
+    
+    diag = {
+        "query": query,
+        "config": {
+            "tavily_keys_configured": len(TAVILY_API_KEYS),
+            "jina_api_key_set": bool(JINA_API_KEY),
+            "chunk_size": INTERNET_RAG_CHUNK_SIZE,
+            "top_k": INTERNET_RAG_TOP_K,
+            "max_extract_urls": INTERNET_RAG_MAX_EXTRACT_URLS,
+            "max_evidence_chars": INTERNET_RAG_MAX_EVIDENCE_CHARS,
+            "multimodal_max_evidence_chars": MAX_EVIDENCE_CHARS,
+            "multimodal_max_prompt_chars": MAX_PROMPT_CHARS,
+        },
+        "step_1_tavily_search": {},
+        "step_2_sources_built": [],
+        "step_3_raw_content_usage": {},
+        "step_4_jina_extraction": [],
+        "step_5_chunks_created": {},
+        "step_6_reranking": {},
+        "step_7_final_evidence_block": {},
+        "step_8_full_pipeline_result": {},
+        "errors": [],
+    }
+    
+    try:
+        # Step 1: Raw Tavily search
+        try:
+            tavily_data = await _tavily_search_with_rotation(query, max_results=6)
+            results = tavily_data.get("results") or []
+            diag["step_1_tavily_search"] = {
+                "total_results": len(results),
+                "results": [
+                    {
+                        "title": (r.get("title") or "")[:100],
+                        "url": (r.get("url") or "")[:200],
+                        "content_length": len(r.get("content") or ""),
+                        "content_preview": (r.get("content") or "")[:300],
+                        "raw_content_length": len(r.get("raw_content") or ""),
+                        "raw_content_preview": (r.get("raw_content") or "")[:500],
+                        "has_raw_content": bool((r.get("raw_content") or "").strip()),
+                    }
+                    for r in results[:6]
+                ],
+            }
+        except Exception as e:
+            diag["errors"].append({"step": "tavily_search", "error": str(e), "traceback": traceback.format_exc()})
+            tavily_data = {"results": []}
+            results = []
+        
+        # Step 2: Show which URLs would be extracted
+        sources_built = []
+        for idx, r in enumerate(results[:6], start=1):
+            raw_len = len((r.get("raw_content") or "").strip())
+            sources_built.append({
+                "index": idx,
+                "title": (r.get("title") or "")[:100],
+                "url": (r.get("url") or "")[:200],
+                "snippet_length": len((r.get("content") or "").strip()),
+                "raw_content_length": raw_len,
+                "would_use_raw_content": raw_len >= 300,
+                "would_need_jina": raw_len < 300,
+            })
+        diag["step_2_sources_built"] = sources_built
+        
+        # Step 3: Show raw_content usage stats
+        raw_available = sum(1 for s in sources_built if s["would_use_raw_content"])
+        need_jina = sum(1 for s in sources_built if s["would_need_jina"])
+        diag["step_3_raw_content_usage"] = {
+            "total_sources": len(sources_built),
+            "have_rich_raw_content": raw_available,
+            "need_jina_extraction": need_jina,
+            "note": "raw_content >= 300 chars is considered 'rich' and should be used directly without calling Jina Reader"
+        }
+        
+        # Step 4: Test Jina Reader extraction on first URL that needs it (or first URL)
+        jina_results = []
+        test_urls = [(s["url"], s["title"]) for s in sources_built[:2]] if sources_built else []
+        for test_url, test_title in test_urls:
+            try:
+                extracted = await _extract_content_via_jina_reader(test_url)
+                jina_results.append({
+                    "url": test_url[:200],
+                    "success": bool(extracted),
+                    "content_length": len(extracted) if extracted else 0,
+                    "content_preview": (extracted or "")[:500],
+                    "error": None,
+                })
+            except Exception as e:
+                jina_results.append({
+                    "url": test_url[:200],
+                    "success": False,
+                    "content_length": 0,
+                    "content_preview": "",
+                    "error": str(e),
+                })
+        diag["step_4_jina_extraction"] = jina_results
+        
+        # Step 5: Test chunking on best available content
+        best_content = ""
+        best_source = "none"
+        if jina_results and jina_results[0].get("success"):
+            # Re-extract for chunking test
+            best_content = (await _extract_content_via_jina_reader(test_urls[0][0])) or ""
+            best_source = "jina_reader"
+        elif results and (results[0].get("raw_content") or "").strip():
+            best_content = (results[0].get("raw_content") or "").strip()
+            best_source = "tavily_raw_content"
+        elif results and (results[0].get("content") or "").strip():
+            best_content = (results[0].get("content") or "").strip()
+            best_source = "tavily_snippet"
+        
+        if best_content:
+            chunks = _smart_chunk_text(best_content, chunk_size=INTERNET_RAG_CHUNK_SIZE)
+            diag["step_5_chunks_created"] = {
+                "source_of_content": best_source,
+                "original_content_length": len(best_content),
+                "num_chunks": len(chunks),
+                "chunk_sizes": [len(c) for c in chunks],
+                "chunk_previews": [(c[:200] + "...") if len(c) > 200 else c for c in chunks[:4]],
+            }
+        else:
+            diag["step_5_chunks_created"] = {
+                "source_of_content": "none",
+                "original_content_length": 0,
+                "num_chunks": 0,
+                "note": "No content available to chunk - this is the core problem!"
+            }
+        
+        # Step 6: Test reranking (if we have chunks and Jina key)
+        if best_content and JINA_API_KEY:
+            chunks = _smart_chunk_text(best_content, chunk_size=INTERNET_RAG_CHUNK_SIZE)
+            chunk_dicts = [{"source_index": 1, "url": "test", "title": "test", "content": c} for c in chunks]
+            try:
+                reranked = await _rerank_chunks_via_jina(query, chunk_dicts, top_k=INTERNET_RAG_TOP_K)
+                diag["step_6_reranking"] = {
+                    "input_chunks": len(chunk_dicts),
+                    "output_chunks": len(reranked),
+                    "top_chunk_preview": (reranked[0]["content"][:300] + "...") if reranked else "",
+                    "reranker_working": True,
+                }
+            except Exception as e:
+                diag["step_6_reranking"] = {
+                    "reranker_working": False,
+                    "error": str(e),
+                }
+        else:
+            diag["step_6_reranking"] = {
+                "reranker_working": False,
+                "reason": "no_jina_key" if not JINA_API_KEY else "no_content_to_rerank",
+            }
+        
+        # Step 7: Run the full pipeline and show the evidence block
+        try:
+            sources, evidence_chunks = await internet_rag_search_and_extract(query, max_sources=6)
+            evidence_block = build_web_evidence_block(sources, evidence_chunks)
+            diag["step_7_final_evidence_block"] = {
+                "block_length": len(evidence_block),
+                "block_preview": evidence_block[:1500],
+                "full_block": evidence_block,
+                "num_sources": len(sources),
+                "num_evidence_chunks": len(evidence_chunks),
+                "evidence_chunk_sizes": [len(c.get("content", "")) for c in evidence_chunks],
+                "evidence_chunk_previews": [
+                    {
+                        "source_index": c.get("source_index"),
+                        "title": c.get("title", "")[:80],
+                        "content_length": len(c.get("content", "")),
+                        "content_preview": c.get("content", "")[:300],
+                    }
+                    for c in evidence_chunks[:6]
+                ],
+            }
+        except Exception as e:
+            diag["errors"].append({"step": "full_pipeline", "error": str(e), "traceback": traceback.format_exc()})
+        
+        # Step 8: Summary
+        diag["step_8_full_pipeline_result"] = {
+            "pipeline_healthy": bool(evidence_chunks) if 'evidence_chunks' in locals() else False,
+            "total_evidence_chars": sum(len(c.get("content", "")) for c in evidence_chunks) if 'evidence_chunks' in locals() and evidence_chunks else 0,
+            "would_fit_in_prompt": (len(evidence_block) if 'evidence_block' in locals() else 0) <= MAX_PROMPT_CHARS,
+            "issues_detected": [],
+        }
+        
+        issues = diag["step_8_full_pipeline_result"]["issues_detected"]
+        if not TAVILY_API_KEYS:
+            issues.append("❌ No Tavily API keys configured")
+        if not JINA_API_KEY:
+            issues.append("⚠️ No Jina API key - reranking disabled, Jina Reader may be rate-limited")
+        if not results:
+            issues.append("❌ Tavily returned no results")
+        if results and not any((r.get("raw_content") or "").strip() for r in results):
+            issues.append("⚠️ Tavily returned no raw_content for any result")
+        if 'evidence_chunks' in locals() and not evidence_chunks:
+            issues.append("❌ No evidence chunks produced - LLM gets no web context!")
+        if 'evidence_block' in locals() and len(evidence_block) < 200:
+            issues.append("⚠️ Evidence block is very small (<200 chars) - LLM won't have enough context")
+        if INTERNET_RAG_MAX_EVIDENCE_CHARS < 2000:
+            issues.append(f"⚠️ MAX_EVIDENCE_CHARS={INTERNET_RAG_MAX_EVIDENCE_CHARS} is too small - increase to 3500+")
+        if MAX_PROMPT_CHARS < 8000:
+            issues.append(f"⚠️ MAX_PROMPT_CHARS={MAX_PROMPT_CHARS} is too small - increase to 10000+")
+        if not issues:
+            issues.append("✅ Pipeline looks healthy!")
+            
+    except Exception as e:
+        diag["errors"].append({"step": "overall", "error": str(e), "traceback": traceback.format_exc()})
+    
+    return diag
 
 # -----------------------
 # ENDPOINT
